@@ -1,3 +1,4 @@
+#!/usr/bin/env lua
 --[=[
 This example serves a file/directory browser
 It defaults to serving the current directory.
@@ -92,6 +93,12 @@ local function reply(myserver, stream) -- luacheck: ignore 212
 	res_headers:append("server", default_server)
 	res_headers:append("date", http_util.imf_date())
 
+	if req_method ~= "GET" and req_method ~= "HEAD" then
+		res_headers:upsert(":status", "405")
+		assert(stream:write_headers(res_headers, true))
+		return
+	end
+
 	local path = req_headers:get(":path")
 	local uri_t = assert(uri_reference:match(path), "invalid path")
 	path = http_util.resolve_relative_path("/", uri_t.path)
@@ -145,7 +152,8 @@ local function reply(myserver, stream) -- luacheck: ignore 212
 		</tr></thead>
 		<tbody>
 ]], xml_escape(path), xml_escape(path)), false))
-			-- lfs doesn't provide a way to get an errno for attempting to open a directory https://github.com/keplerproject/luafilesystem/issues/87
+			-- lfs doesn't provide a way to get an errno for attempting to open a directory
+			-- See https://github.com/keplerproject/luafilesystem/issues/87
 			for filename in lfs.dir(real_path) do
 				if not (filename == ".." and path == "/") then -- Exclude parent directory entry listing from top level
 					local stats = lfs.attributes(real_path .. "/" .. filename)

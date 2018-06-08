@@ -16,7 +16,8 @@ Creates a new instance of an HTTP server listening on the given socket.
 	  - `true`: Allows tls connections only
 	  - `false`: Allows non-tls connections only
   - `.ctx` (*context object*): An `openssl.ssl.context` object to use for tls connections. If `nil` is passed, a self-signed context will be generated.
-  - `.client_timeout` (*number*): Timeout (in seconds) to wait for client to send first bytes and/or complete TLS handshake. Default is 10 seconds.
+  - `.connection_setup_timeout` (*number*): Timeout (in seconds) to wait for client to send first bytes and/or complete TLS handshake. Default is 10 seconds.
+  - `.intra_stream_timeout` (*number*): Timeout (in seconds) to wait for a new [*stream*](#stream) on an idle connection before giving up and closing the connection
   - `.version` (*number*): The http version to allow to connect (default: any)
   - `.cq` (*cqueue*): A cqueues controller to use as a main loop. The default is a new controller for the server.
   - `.max_concurrent` (*number*): Maximum number of connections to allow live at a time. Default is infinity.
@@ -116,3 +117,8 @@ Add a new connection socket to the server for processing. The server will use th
   - Another cqueues thread with some other master socket.
   - From inetd for start on demand daemons.
   - A Unix socket with `SCM_RIGHTS`.
+
+
+### `server:add_stream(stream)` <!-- --> {#http.server:add_stream}
+
+Add an existing stream to the server for processing.

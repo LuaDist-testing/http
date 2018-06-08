@@ -9,10 +9,11 @@ local connection_common = require "http.connection_common"
 local onerror = connection_common.onerror
 local h2_error = require "http.h2_error"
 local h2_stream = require "http.h2_stream"
+local known_settings = h2_stream.known_settings
 local hpack = require "http.hpack"
 local h2_banned_ciphers = require "http.tls".banned_ciphers
-local spack = string.pack or require "compat53.string".pack
-local sunpack = string.unpack or require "compat53.string".unpack
+local spack = string.pack or require "compat53.string".pack -- luacheck: ignore 143
+local sunpack = string.unpack or require "compat53.string".unpack -- luacheck: ignore 143
 
 local assert = assert
 if _VERSION:match("%d+%.?%d*") < "5.3" then
@@ -26,23 +27,21 @@ end
 local preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 local default_settings = {
-	[0x1] = 4096; -- HEADER_TABLE_SIZE
-	[0x2] = true; -- ENABLE_PUSH
-	[0x3] = math.huge; -- MAX_CONCURRENT_STREAMS
-	[0x4] = 65535; -- INITIAL_WINDOW_SIZE
-	[0x5] = 16384; -- MAX_FRAME_SIZE
-	[0x6] = math.huge;  -- MAX_HEADER_LIST_SIZE
+	[known_settings.HEADER_TABLE_SIZE] = 4096;
+	[known_settings.ENABLE_PUSH] = true;
+	[known_settings.MAX_CONCURRENT_STREAMS] = math.huge;
+	[known_settings.INITIAL_WINDOW_SIZE] = 65535;
+	[known_settings.MAX_FRAME_SIZE] = 16384;
+	[known_settings.MAX_HEADER_LIST_SIZE] = math.huge;
 }
 
-local function merge_settings(new, old)
-	return {
-		[0x1] = new[0x1] or old[0x1];
-		[0x2] = new[0x2] or old[0x2];
-		[0x3] = new[0x3] or old[0x3];
-		[0x4] = new[0x4] or old[0x4];
-		[0x5] = new[0x5] or old[0x5];
-		[0x6] = new[0x6] or old[0x6];
-	}
+local function merge_settings(tbl, new)
+	for i=0x1, 0x6 do
+		local v = new[i]
+		if v ~= nil then
+			tbl[i] = v
+		end
+	end
 end
 
 local connection_methods = {}
@@ -100,10 +99,6 @@ local function new_connection(socket, conn_type, settings)
 		error('invalid connection type. must be "client" or "server"')
 	end
 
-	socket:setvbuf("full", math.huge) -- 'infinite' buffering; no write locks needed
-	socket:setmode("b", "bf") -- full buffering for now; will be set to no buffering after settings sent
-	socket:onerror(onerror)
-
 	local ssl = socket:checktls()
 	if ssl then
 		local cipher = ssl:getCipherInfo()
@@ -128,6 +123,8 @@ local function new_connection(socket, conn_type, settings)
 
 		-- For continuations
 		need_continuation = nil; -- stream
+		promised_stream = nil; -- stream
+		recv_headers_end_stream = nil;
 		recv_headers_buffer = nil;
 		recv_headers_buffer_pos = nil;
 		recv_headers_buffer_pad_len = nil;
@@ -135,52 +132,49 @@ local function new_connection(socket, conn_type, settings)
 		recv_headers_buffer_length = nil;
 
 		highest_odd_stream = -1;
+		highest_odd_non_idle_stream = -1;
 		highest_even_stream = -2;
+		highest_even_non_idle_stream = -2;
 		send_goaway_lowest = nil;
 		recv_goaway_lowest = nil;
 		recv_goaway = cc.new();
 		new_streams = new_fifo();
 		new_streams_cond = cc.new();
-		peer_settings = default_settings;
+		peer_settings = {};
 		peer_settings_cond = cc.new(); -- signaled when the peer has changed their settings
-		acked_settings = default_settings;
+		acked_settings = {};
 		send_settings = {n = 0};
 		send_settings_ack_cond = cc.new(); -- for when server ACKs our settings
 		send_settings_acked = 0;
 		peer_flow_credits = 65535; -- 5.2.1
-		peer_flow_credits_increase = cc.new();
+		peer_flow_credits_change = cc.new();
 		encoding_context = nil;
 		decoding_context = nil;
 		pongs = {}; -- pending pings we've sent. keyed by opaque 8 byte payload
 	}, connection_mt)
 	self:new_stream(0)
-	self.encoding_context = hpack.new(default_settings[0x1])
-	self.decoding_context = hpack.new(default_settings[0x1])
+	merge_settings(self.peer_settings, default_settings)
+	merge_settings(self.acked_settings, default_settings)
+	self.encoding_context = hpack.new(default_settings[known_settings.HEADER_TABLE_SIZE])
+	self.decoding_context = hpack.new(default_settings[known_settings.HEADER_TABLE_SIZE])
 
+	socket:setvbuf("full", math.huge) -- 'infinite' buffering; no write locks needed
+	socket:setmode("b", "bna") -- writes that don't explicitly buffer will now flush the buffer. autoflush on
+	socket:onerror(onerror)
 	if self.type == "client" then
-		-- fully buffered write; will be flushed when sending settings
 		assert(socket:xwrite(preface, "f", 0))
 	end
-	assert(self.stream0:write_settings_frame(false, settings or {}, 0))
-	socket:setmode("b", "bna") -- writes that don't explicitly buffer will now flush the buffer. autoflush on
+	assert(self.stream0:write_settings_frame(false, settings or {}, 0, "f"))
 	-- note that the buffer is *not* flushed right now
 
 	return self
-end
-
-function connection_methods:pollfd()
-	return self.socket:pollfd()
-end
-
-function connection_methods:events()
-	return self.socket:events()
 end
 
 function connection_methods:timeout()
 	if not self.had_eagain then
 		return 0
 	end
-	return self.socket:timeout()
+	return connection_common.methods.timeout(self)
 end
 
 local function handle_frame(self, typ, flag, streamid, payload, deadline)
@@ -192,19 +186,38 @@ local function handle_frame(self, typ, flag, streamid, payload, deadline)
 	-- Implementations MUST ignore and discard any frame that has a type that is unknown.
 	if handler then
 		local stream = self.streams[streamid]
-		if stream == nil and (not self.recv_goaway_lowest or streamid < self.recv_goaway_lowest) then
+		if stream == nil then
 			if xor(streamid % 2 == 1, self.type == "client") then
 				return nil, h2_error.errors.PROTOCOL_ERROR:new_traceback("Streams initiated by a client MUST use odd-numbered stream identifiers; those initiated by the server MUST use even-numbered stream identifiers"), ce.EILSEQ
 			end
 			-- TODO: check MAX_CONCURRENT_STREAMS
 			stream = self:new_stream(streamid)
-			self.new_streams:push(stream)
-			self.new_streams_cond:signal(1)
+			--[[ http2 spec section 6.8
+			the sender will ignore frames sent on streams initiated by
+			the receiver if the stream has an identifier higher than the included
+			last stream identifier
+			...
+			After sending a GOAWAY frame, the sender can discard frames for
+			streams initiated by the receiver with identifiers higher than the
+			identified last stream.  However, any frames that alter connection
+			state cannot be completely ignored.  For instance, HEADERS,
+			PUSH_PROMISE, and CONTINUATION frames MUST be minimally processed to
+			ensure the state maintained for header compression is consistent (see
+			Section 4.3); similarly, DATA frames MUST be counted toward the
+			connection flow-control window.  Failure to process these frames can
+			cause flow control or header compression state to become
+			unsynchronized.]]
+			-- If we haven't seen this stream before, and we should be discarding frames from it,
+			-- then don't push it into the new_streams fifo
+			if self.send_goaway_lowest == nil or streamid <= self.send_goaway_lowest then
+				self.new_streams:push(stream)
+				self.new_streams_cond:signal(1)
+			end
 		end
 		local ok, err, errno = handler(stream, flag, payload, deadline)
 		if not ok then
 			if h2_error.is(err) and err.stream_error and streamid ~= 0 and stream.state ~= "idle" then
-				local ok2, err2, errno2 = stream:write_rst_stream(err.code, deadline and deadline-monotime())
+				local ok2, err2, errno2 = stream:rst_stream(err, deadline and deadline-monotime())
 				if not ok2 then
 					return nil, err2, errno2
 				end
@@ -300,40 +313,13 @@ function connection_methods:shutdown()
 end
 
 function connection_methods:new_stream(id)
+	if id and self.streams[id] ~= nil then
+		error("stream id already in use")
+	end
+	local stream = h2_stream.new(self)
 	if id then
-		assert(id % 1 == 0)
-	else
-		if self.recv_goaway_lowest then
-			h2_error.errors.PROTOCOL_ERROR("Receivers of a GOAWAY frame MUST NOT open additional streams on the connection")
-		end
-		if self.type == "client" then
-			-- Pick next free odd number
-			id = self.highest_odd_stream + 2
-		else
-			-- Pick next free odd number
-			id = self.highest_even_stream + 2
-		end
-		-- TODO: check MAX_CONCURRENT_STREAMS
+		stream:pick_id(id)
 	end
-	assert(self.streams[id] == nil, "stream id already in use")
-	assert(id < 2^32, "stream id too large")
-	if id % 2 == 0 then
-		if id > self.highest_even_stream then
-			self.highest_even_stream = id
-		end
-	else
-		if id > self.highest_odd_stream then
-			self.highest_odd_stream = id
-		end
-	end
-	local stream = h2_stream.new(self, id)
-	if id == 0 then
-		self.stream0 = stream
-	else
-		-- Add dependency on stream 0. http2 spec, 5.3.1
-		self.stream0:reprioritise(stream)
-	end
-	self.streams[id] = stream
 	return stream
 end
 
@@ -385,10 +371,14 @@ function connection_methods:read_http2_frame(timeout)
 		end
 	end
 	local size, typ, flags, streamid = sunpack(">I3 B B I4", frame_header)
-	if size > self.acked_settings[0x5] then
+	if size > self.acked_settings[known_settings.MAX_FRAME_SIZE] then
+		local ok, errno2 = self.socket:unget(frame_header)
+		if not ok then
+			return nil, onerror(self.socket, "unget", errno2, 2)
+		end
 		return nil, h2_error.errors.FRAME_SIZE_ERROR:new_traceback("frame too large"), ce.E2BIG
 	end
-	local payload, err2, errno2 = self.socket:xread(size, deadline and (deadline-monotime()))
+	local payload, err2, errno2 = self.socket:xread(size, 0)
 	self.had_eagain = false
 	if payload and #payload < size then -- hit EOF
 		local ok, errno4 = self.socket:unget(payload)
@@ -398,15 +388,18 @@ function connection_methods:read_http2_frame(timeout)
 		payload = nil
 	end
 	if payload == nil then
-		if errno2 == ce.ETIMEDOUT then
-			self.had_eagain = true
-		end
 		-- put frame header back into socket so a retry will work
 		local ok, errno3 = self.socket:unget(frame_header)
 		if not ok then
 			return nil, onerror(self.socket, "unget", errno3, 2)
 		end
-		if err2 == nil then
+		if errno2 == ce.ETIMEDOUT then
+			self.had_eagain = true
+			timeout = deadline and deadline-monotime()
+			if cqueues.poll(self.socket, timeout) ~= timeout then
+				return self:read_http2_frame(deadline and deadline-monotime())
+			end
+		elseif err2 == nil then
 			self.socket:seterror("r", ce.EILSEQ)
 			return nil, onerror(self.socket, "read_http2_frame", ce.EILSEQ)
 		end
@@ -420,17 +413,16 @@ end
 -- If this times out, it was the flushing; not the write itself
 -- hence it's not always total failure.
 -- It's up to the caller to take some action (e.g. closing) rather than doing it here
-function connection_methods:write_http2_frame(typ, flags, streamid, payload, timeout)
-	local deadline = timeout and monotime()+timeout
-	if #payload > self.peer_settings[0x5] then
+function connection_methods:write_http2_frame(typ, flags, streamid, payload, timeout, flush)
+	if #payload > self.peer_settings[known_settings.MAX_FRAME_SIZE] then
 		return nil, h2_error.errors.FRAME_SIZE_ERROR:new_traceback("frame too large"), ce.E2BIG
 	end
 	local header = spack(">I3 B B I4", #payload, typ, flags, streamid)
-	local ok, err, errno = self.socket:xwrite(header, "f", timeout)
+	local ok, err, errno = self.socket:xwrite(header, "f", 0)
 	if not ok then
 		return nil, err, errno
 	end
-	return self.socket:xwrite(payload, deadline and deadline-monotime())
+	return self.socket:xwrite(payload, flush, timeout)
 end
 
 function connection_methods:ping(timeout)
@@ -470,7 +462,33 @@ function connection_methods:write_goaway_frame(last_stream_id, err_code, debug_m
 end
 
 function connection_methods:set_peer_settings(peer_settings)
-	self.peer_settings = merge_settings(peer_settings, self.peer_settings)
+	--[[ 6.9.2:
+	In addition to changing the flow-control window for streams that are
+	not yet active, a SETTINGS frame can alter the initial flow-control
+	window size for streams with active flow-control windows (that is,
+	streams in the "open" or "half-closed (remote)" state).  When the
+	value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust
+	the size of all stream flow-control windows that it maintains by the
+	difference between the new value and the old value.
+
+	A change to SETTINGS_INITIAL_WINDOW_SIZE can cause the available
+	space in a flow-control window to become negative.  A sender MUST
+	track the negative flow-control window and MUST NOT send new flow-
+	controlled frames until it receives WINDOW_UPDATE frames that cause
+	the flow-control window to become positive.]]
+	local new_window_size = peer_settings[known_settings.INITIAL_WINDOW_SIZE]
+	if new_window_size then
+		local old_windows_size = self.peer_settings[known_settings.INITIAL_WINDOW_SIZE]
+		local delta = new_window_size - old_windows_size
+		if delta ~= 0 then
+			for _, stream in pairs(self.streams) do
+				stream.peer_flow_credits = stream.peer_flow_credits + delta
+				stream.peer_flow_credits_change:signal()
+			end
+		end
+	end
+
+	merge_settings(self.peer_settings, peer_settings)
 	self.peer_settings_cond:signal()
 end
 
@@ -480,7 +498,7 @@ function connection_methods:ack_settings()
 	local acked_settings = self.send_settings[n]
 	if acked_settings then
 		self.send_settings[n] = nil
-		self.acked_settings = merge_settings(acked_settings, self.acked_settings)
+		merge_settings(self.acked_settings, acked_settings)
 	end
 	self.send_settings_ack_cond:signal()
 end

@@ -2,12 +2,12 @@
 -- Reference documentation: https://http2.github.io/http2-spec/compression.html
 
 local schar = string.char
-local spack = string.pack or require "compat53.string".pack
-local sunpack = string.unpack or require "compat53.string".unpack
+local spack = string.pack or require "compat53.string".pack -- luacheck: ignore 143
+local sunpack = string.unpack or require "compat53.string".unpack -- luacheck: ignore 143
 local band = require "http.bit".band
 local bor = require "http.bit".bor
 local new_headers = require "http.headers".new
-local unpack = table.unpack or unpack -- luacheck: ignore 113
+local unpack = table.unpack or unpack -- luacheck: ignore 113 143
 local h2_errors = require "http.h2_error".errors
 
 -- Section 5.1
@@ -353,6 +353,7 @@ do
 		end
 		byte_to_bitstring[string.char(i)] = val
 	end
+	local EOS_length = #huffman_codes.EOS
 	huffman_decode = function(s)
 		local bitstring = s:gsub(".", byte_to_bitstring)
 		local node = huffman_tree
@@ -365,18 +366,29 @@ do
 				node = huffman_tree
 			elseif node == "EOS" then
 				-- 5.2: A Huffman encoded string literal containing the EOS symbol MUST be treated as a decoding error.
-				assert(node ~= 256, "invalid huffman code (EOS)")
+				return nil, h2_errors.COMPRESSION_ERROR:new_traceback("invalid huffman code (EOS)")
 			elseif nt ~= "table" then
-				error("invalid huffman code")
+				return nil, h2_errors.COMPRESSION_ERROR:new_traceback("invalid huffman code")
 			end
 		end
 		--[[ Ensure that any left over bits are all one.
 		Section 5.2: A padding not corresponding to the most significant bits
 		of the code for the EOS symbol MUST be treated as a decoding error]]
-		while type(node) == "table" do
-			node = node["1"]
+		if node ~= huffman_tree then
+			-- We check this by continuing through on the '1' branch and ensure that we end up at EOS
+			local n_padding = EOS_length
+			while type(node) == "table" do
+				node = node["1"]
+				n_padding = n_padding - 1
+			end
+			if node ~= "EOS" then
+				return nil, h2_errors.COMPRESSION_ERROR:new_traceback("invalid huffman padding: expected most significant bits to match EOS")
+			end
+			-- Section 5.2: A padding strictly longer than 7 bits MUST be treated as a decoding error
+			if n_padding < 0 or n_padding >= 8 then
+				return nil, h2_errors.COMPRESSION_ERROR:new_traceback("invalid huffman padding: too much padding")
+			end
 		end
-		assert(node == "EOS", "invalid huffman padding")
 
 		return string.char(unpack(output))
 	end
@@ -413,10 +425,13 @@ local function decode_string(str, pos)
 	if newpos > #str+1 then return end
 	local val = str:sub(pos, newpos-1)
 	if huffman then
-		return huffman_decode(val), newpos
-	else
-		return val, newpos
+		local err
+		val, err = huffman_decode(val)
+		if not val then
+			return nil, err
+		end
 	end
+	return val, newpos
 end
 
 local function compound_key(name, value)
@@ -430,24 +445,19 @@ local function dynamic_table_entry_size(k)
 	return 32 - 8 + #k -- 8 is number of bytes of overhead introduced by compound_key
 end
 local static_names_to_index = {}
-local static_index_to_names = {}
-local static_pairs = {} -- Duplicate writes are okay
+local static_pairs = {}
 local max_static_index
 do
 	-- We prefer earlier indexes as examples in spec are like that
-	local function s(i, name)
+	local function p(i, name, value)
 		if not static_names_to_index[name] then
 			static_names_to_index[name] = i
-			static_index_to_names[i] = name
 		end
-	end
-	local function p(i, name, value)
-		s(i, name)
-		local k = compound_key(name, value)
+		local k = compound_key(name, value or "")
 		static_pairs[k] = i
 		static_pairs[i] = k
 	end
-	s( 1, ":authority")
+	p( 1, ":authority")
 	p( 2, ":method", "GET")
 	p( 3, ":method", "POST")
 	p( 4, ":path", "/")
@@ -461,53 +471,53 @@ do
 	p(12, ":status", "400")
 	p(13, ":status", "404")
 	p(14, ":status", "500")
-	s(15, "accept-charset")
+	p(15, "accept-charset")
 	p(16, "accept-encoding", "gzip, deflate")
-	s(17, "accept-language")
-	s(18, "accept-ranges")
-	s(19, "accept")
-	s(20, "access-control-allow-origin")
-	s(21, "age")
-	s(22, "allow")
-	s(23, "authorization")
-	s(24, "cache-control")
-	s(25, "content-disposition")
-	s(26, "content-encoding")
-	s(27, "content-language")
-	s(28, "content-length")
-	s(29, "content-location")
-	s(30, "content-range")
-	s(31, "content-type")
-	s(32, "cookie")
-	s(33, "date")
-	s(34, "etag")
-	s(35, "expect")
-	s(36, "expires")
-	s(37, "from")
-	s(38, "host")
-	s(39, "if-match")
-	s(40, "if-modified-since")
-	s(41, "if-none-match")
-	s(42, "if-range")
-	s(43, "if-unmodified-since")
-	s(44, "last-modified")
-	s(45, "link")
-	s(46, "location")
-	s(47, "max-forwards")
-	s(48, "proxy-authenticate")
-	s(49, "proxy-authorization")
-	s(50, "range")
-	s(51, "referer")
-	s(52, "refresh")
-	s(53, "retry-after")
-	s(54, "server")
-	s(55, "set-cookie")
-	s(56, "strict-transport-security")
-	s(57, "transfer-encoding")
-	s(58, "user-agent")
-	s(59, "vary")
-	s(60, "via")
-	s(61, "www-authenticate")
+	p(17, "accept-language")
+	p(18, "accept-ranges")
+	p(19, "accept")
+	p(20, "access-control-allow-origin")
+	p(21, "age")
+	p(22, "allow")
+	p(23, "authorization")
+	p(24, "cache-control")
+	p(25, "content-disposition")
+	p(26, "content-encoding")
+	p(27, "content-language")
+	p(28, "content-length")
+	p(29, "content-location")
+	p(30, "content-range")
+	p(31, "content-type")
+	p(32, "cookie")
+	p(33, "date")
+	p(34, "etag")
+	p(35, "expect")
+	p(36, "expires")
+	p(37, "from")
+	p(38, "host")
+	p(39, "if-match")
+	p(40, "if-modified-since")
+	p(41, "if-none-match")
+	p(42, "if-range")
+	p(43, "if-unmodified-since")
+	p(44, "last-modified")
+	p(45, "link")
+	p(46, "location")
+	p(47, "max-forwards")
+	p(48, "proxy-authenticate")
+	p(49, "proxy-authorization")
+	p(50, "range")
+	p(51, "referer")
+	p(52, "refresh")
+	p(53, "retry-after")
+	p(54, "server")
+	p(55, "set-cookie")
+	p(56, "strict-transport-security")
+	p(57, "transfer-encoding")
+	p(58, "user-agent")
+	p(59, "vary")
+	p(60, "via")
+	p(61, "www-authenticate")
 	max_static_index = 61
 end
 
@@ -723,17 +733,11 @@ function methods:lookup_name_index(name)
 	return nil
 end
 
-function methods:lookup_index(index, allow_single)
+function methods:lookup_index(index)
 	if index <= max_static_index then
 		local k = static_pairs[index]
 		if k then
 			return uncompound_key(k)
-		end
-		if allow_single then
-			local name = static_index_to_names[index]
-			if name then
-				return name, nil
-			end
 		end
 	else -- Dynamic?
 		local id = self:dynamic_index_to_table_id(index)
@@ -797,15 +801,12 @@ local function decode_header_helper(self, payload, prefix_len, pos)
 		if name == nil then
 			return name, pos
 		end
-		if name:match("%u") then
-			return nil, h2_errors.PROTOCOL_ERROR:new_traceback("malformed: header fields must not be uppercase")
-		end
 		value, pos = decode_string(payload, pos)
 		if value == nil then
 			return value, pos
 		end
 	else
-		name = self:lookup_index(index, true)
+		name = self:lookup_index(index)
 		if name == nil then
 			return nil, h2_errors.COMPRESSION_ERROR:new_traceback(string.format("index %d not found in table", index))
 		end
@@ -826,7 +827,7 @@ function methods:decode_headers(payload, header_list, pos)
 			local index, newpos = decode_integer(payload, 7, pos)
 			if index == nil then break end
 			pos = newpos
-			local name, value = self:lookup_index(index, false)
+			local name, value = self:lookup_index(index)
 			if name == nil then
 				return nil, h2_errors.COMPRESSION_ERROR:new_traceback(string.format("index %d not found in table", index))
 			end

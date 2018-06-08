@@ -1,7 +1,7 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "http"
-version = "0.1-0"
+version = "0.2-0"
 
 description = {
 	summary = "HTTP library for Lua";
@@ -11,13 +11,13 @@ description = {
 
 -- LuaDist source
 source = {
-  tag = "0.1-0",
+  tag = "0.2-0",
   url = "git://github.com/LuaDist-testing/http.git"
 }
 -- Original source
 -- source = {
--- 	url = "https://github.com/daurnimator/lua-http/archive/v0.1.zip";
--- 	dir = "lua-http-0.1";
+-- 	url = "https://github.com/daurnimator/lua-http/archive/v0.2.zip";
+-- 	dir = "lua-http-0.2";
 -- }
 
 dependencies = {

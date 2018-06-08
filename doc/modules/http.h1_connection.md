@@ -17,6 +17,21 @@ Specifies the HTTP version used for the connection handshake. Valid values are:
 See [`connection.version`](#connection.version)
 
 
+### `h1_connection:pollfd()` <!-- --> {#http.h1_connection:pollfd}
+
+See [`connection:pollfd()`](#connection:pollfd)
+
+
+### `h1_connection:events()` <!-- --> {#http.h1_connection:events}
+
+See [`connection:events()`](#connection:events)
+
+
+### `h1_connection:timeout()` <!-- --> {#http.h1_connection:timeout}
+
+See [`connection:timeout()`](#connection:timeout)
+
+
 ### `h1_connection:connect(timeout)` <!-- --> {#http.h1_connection:connect}
 
 See [`connection:connect(timeout)`](#connection:connect)
@@ -42,7 +57,11 @@ See [`connection:peername()`](#connection:peername)
 See [`connection:flush(timeout)`](#connection:flush)
 
 
-### `h1_connection:shutdown()` <!-- --> {#http.h1_connection:shutdown}
+### `h1_connection:shutdown(dir)` <!-- --> {#http.h1_connection:shutdown}
+
+Shut down is as graceful as possible: pipelined streams are [shutdown](#http.h1_stream:shutdown), then the underlying socket is shut down in the appropriate direction(s).
+
+`dir` is a string representing the direction of communication to shut down communication in. If it contains `"r"` it will shut down reading, if it contains `"w"` it will shut down writing. The default is `"rw"`, i.e. to shutdown communication in both directions.
 
 See [`connection:shutdown()`](#connection:shutdown)
 
@@ -149,12 +168,12 @@ Terminates a header block by writing a blank line (`"\r\n"`) to the socket. This
 
 Writes a chunk of data to the socket. `chunk_ext` must be `nil` as chunk extensions are not supported. Will yield until complete or `timeout` is exceeded. Returns true on success. Returns `nil`, an error message and an error number if the write fails.
 
-*Note that `chunk` will not be flushed to the remote server until [`write_body_last_chunk`](#http.h1_connection:write_body_last_chunk) is called.*
-
 
 ### `h1_connection:write_body_last_chunk(chunk_ext, timeout)` <!-- --> {#http.h1_connection:write_body_last_chunk}
 
-Writes the chunked body terminator `"0\r\n"` to the socket and flushes the socket output buffer. `chunk_ext` must be `nil` as chunk extensions are not supported. Will yield until complete or `timeout` is exceeded. Returns `nil`, an error message and an error number if the write fails.
+Writes the chunked body terminator `"0\r\n"` to the socket. `chunk_ext` must be `nil` as chunk extensions are not supported. Will yield until complete or `timeout` is exceeded. Returns `nil`, an error message and an error number if the write fails.
+
+*Note that the connection will not be immediately flushed to the remote server; normally this will occur when trailers are written.*
 
 
 ### `h1_connection:write_body_plain(body, timeout)` <!-- --> {#http.h1_connection:write_body_plain}

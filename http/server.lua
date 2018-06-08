@@ -45,7 +45,8 @@ end
 -- Wrap a bare cqueues socket in an HTTP connection of a suitable version
 -- Starts TLS if necessary
 -- this function *should never throw*
-local function wrap_socket(self, socket, deadline)
+local function wrap_socket(self, socket, timeout)
+	local deadline = timeout and monotime()+timeout
 	socket:setmode("b", "b")
 	socket:onerror(onerror)
 	local version = self.version
@@ -79,7 +80,7 @@ local function wrap_socket(self, socket, deadline)
 	if version == nil then
 		local is_h2, err, errno = h2_connection.socket_has_preface(socket, true, deadline and (deadline-monotime()))
 		if is_h2 == nil then
-			return nil, err, errno
+			return nil, err or ce.EPIPE, errno
 		end
 		version = is_h2 and 2 or 1.1
 	end
@@ -126,7 +127,7 @@ end
 
 local function handle_socket(self, socket)
 	local error_operation, error_context
-	local conn, err, errno = wrap_socket(self, socket)
+	local conn, err, errno = wrap_socket(self, socket, self.connection_setup_timeout)
 	if not conn then
 		socket:close()
 		if err ~= ce.EPIPE -- client closed connection
@@ -138,30 +139,32 @@ local function handle_socket(self, socket)
 	else
 		local cond = cc.new()
 		local idle = true
+		local deadline
 		conn:onidle(function()
 			idle = true
+			deadline = self.intra_stream_timeout + monotime()
 			cond:signal(1)
 		end)
 		while true do
+			local timeout = deadline and deadline-monotime() or self.intra_stream_timeout
 			local stream
-			stream, err, errno = conn:get_next_incoming_stream()
+			stream, err, errno = conn:get_next_incoming_stream(timeout)
 			if stream == nil then
 				if (err ~= nil -- client closed connection
 					and errno ~= ce.ECONNRESET
-					and errno ~= ce.ENOTCONN) then
+					and errno ~= ce.ENOTCONN
+					and errno ~= ce.ETIMEDOUT) then
 					error_operation = "get_next_incoming_stream"
 					error_context = conn
+					break
+				elseif errno ~= ce.ETIMEDOUT or not idle or (deadline and deadline <= monotime()) then -- want to go around loop again if deadline not hit
+					break
 				end
-				break
+			else
+				idle = false
+				deadline = nil
+				self:add_stream(stream)
 			end
-			idle = false
-			self.cq:wrap(function()
-				local ok, err2 = http_util.yieldable_pcall(self.onstream, self, stream)
-				stream:shutdown()
-				if not ok then
-					self:onerror()(self, stream, "onstream", err2)
-				end
-			end)
 		end
 		-- wait for streams to complete
 		if not idle then
@@ -176,33 +179,24 @@ local function handle_socket(self, socket)
 	end
 end
 
+local function handle_stream(self, stream)
+	local ok, err = http_util.yieldable_pcall(self.onstream, self, stream)
+	stream:shutdown()
+	if not ok then
+		self:onerror()(self, stream, "onstream", err)
+	end
+end
+
 -- Prefer whichever comes first
-local function alpn_select_either(ssl, protos) -- luacheck: ignore 212
+local function alpn_select(ssl, protos, version)
 	for _, proto in ipairs(protos) do
-		if proto == "h2" then
-			-- HTTP2 only allows >=TLSv1.2
-			if ssl:getVersion() >= openssl_ssl.TLS1_2_VERSION then
+		if proto == "h2" and (version == nil or version == 2) then
+			-- HTTP2 only allows >= TLSv1.2
+			-- allow override via version
+			if ssl:getVersion() >= openssl_ssl.TLS1_2_VERSION or version == 2 then
 				return proto
 			end
-		elseif proto == "http/1.1" then
-			return proto
-		end
-	end
-	return nil
-end
-
-local function alpn_select_h2(ssl, protos) -- luacheck: ignore 212
-	for _, proto in ipairs(protos) do
-		if proto == "h2" then
-			return proto
-		end
-	end
-	return nil
-end
-
-local function alpn_select_h1(ssl, protos) -- luacheck: ignore 212
-	for _, proto in ipairs(protos) do
-		if proto == "http/1.1" then
+		elseif proto == "http/1.1" and (version == nil or version == 1.1) then
 			return proto
 		end
 	end
@@ -213,13 +207,7 @@ end
 local function new_ctx(host, version)
 	local ctx = http_tls.new_server_context()
 	if http_tls.has_alpn then
-		if version == nil then
-			ctx:setAlpnSelect(alpn_select_either)
-		elseif version == 2 then
-			ctx:setAlpnSelect(alpn_select_h2)
-		elseif version == 1.1 then
-			ctx:setAlpnSelect(alpn_select_h1)
-		end
+		ctx:setAlpnSelect(alpn_select, version)
 	end
 	if version == 2 then
 		ctx:setOptions(openssl_ctx.OP_NO_TLSv1 + openssl_ctx.OP_NO_TLSv1_1)
@@ -253,7 +241,8 @@ end
 local server_methods = {
 	version = nil;
 	max_concurrent = math.huge;
-	client_timeout = 10;
+	connection_setup_timeout = 10;
+	intra_stream_timeout = 10;
 }
 local server_mt = {
 	__name = "http.server";
@@ -269,7 +258,7 @@ end
 
 Takes a table of options:
   - `.cq` (optional): A cqueues controller to use
-  - `.socket`: A cqueues socket object
+  - `.socket` (optional): A cqueues socket object to accept() from
   - `.onstream`: function to call back for each stream read
   - `.onerror`: function that will be called when an error occurs (default: throw an error)
   - `.tls`: `nil`: allow both tls and non-tls connections
@@ -279,7 +268,8 @@ Takes a table of options:
   - `       `nil`: a self-signed context will be generated
   - `.version`: the http version to allow to connect (default: any)
   - `.max_concurrent`: Maximum number of connections to allow live at a time (default: infinity)
-  - `.client_timeout`: Timeout (in seconds) to wait for client to send first bytes and/or complete TLS handshake (default: 10)
+  - `.connection_setup_timeout`: Timeout (in seconds) to wait for client to send first bytes and/or complete TLS handshake (default: 10)
+  - `.intra_stream_timeout`: Timeout (in seoncds) to wait between start of client streams (default: 10)
 ]]
 local function new_server(tbl)
 	local cq = tbl.cq
@@ -288,17 +278,14 @@ local function new_server(tbl)
 	else
 		assert(cqueues.type(cq) == "controller", "optional cq field should be a cqueue controller")
 	end
-	local socket = assert(tbl.socket, "missing 'socket'")
+	local socket = tbl.socket
+	if socket ~= nil then
+		assert(cs.type(socket), "optional socket field should be a cqueues socket")
+	end
 	local onstream = assert(tbl.onstream, "missing 'onstream'")
-
 	if tbl.ctx == nil and tbl.tls ~= false then
 		error("OpenSSL context required if .tls isn't false")
 	end
-
-	-- Return errors rather than throwing
-	socket:onerror(function(s, op, why, lvl) -- luacheck: ignore 431 212
-		return why
-	end)
 
 	local self = setmetatable({
 		cq = cq;
@@ -313,10 +300,17 @@ local function new_server(tbl)
 		pause_cond = cc.new();
 		paused = false;
 		connection_done = cc.new(); -- signalled when connection has been closed
-		client_timeout = tbl.client_timeout;
+		connection_setup_timeout = tbl.connection_setup_timeout;
+		intra_stream_timeout = tbl.intra_stream_timeout;
 	}, server_mt)
 
-	cq:wrap(server_loop, self)
+	if socket then
+		-- Return errors rather than throwing
+		socket:onerror(function(socket, op, why, lvl) -- luacheck: ignore 431 212
+			return why
+		end)
+		cq:wrap(server_loop, self)
+	end
 
 	return self
 end
@@ -381,7 +375,8 @@ local function listen(tbl)
 		ctx = ctx;
 		version = tbl.version;
 		max_concurrent = tbl.max_concurrent;
-		client_timeout = tbl.client_timeout;
+		connection_setup_timeout = tbl.connection_setup_timeout;
+		intra_stream_timeout = tbl.intra_stream_timeout;
 	}
 end
 
@@ -404,11 +399,20 @@ end
 -- Actually wait for and *do* the binding
 -- Don't *need* to call this, as if not it will be done lazily
 function server_methods:listen(timeout)
-	return ca.fileresult(self.socket:listen(timeout))
+	if self.socket then
+		local ok, err, errno = ca.fileresult(self.socket:listen(timeout))
+		if not ok then
+			return nil, err, errno
+		end
+	end
+	return true
 end
 
 function server_methods:localname()
-	return self.socket:localname()
+	if self.socket == nil then
+		return
+	end
+	return ca.fileresult(self.socket:localname())
 end
 
 function server_methods:pause()
@@ -466,6 +470,11 @@ end
 function server_methods:add_socket(socket)
 	self.n_connections = self.n_connections + 1
 	self.cq:wrap(handle_socket, self, socket)
+	return true
+end
+
+function server_methods:add_stream(stream)
+	self.cq:wrap(handle_stream, self, stream)
 	return true
 end
 

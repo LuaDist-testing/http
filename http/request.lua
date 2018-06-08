@@ -16,6 +16,10 @@ local default_user_agent = string.format("%s/%s", http_version.name, http_versio
 local default_hsts_store = http_hsts.new_store()
 local default_proxies = http_proxies.new():update()
 
+local default_h2_settings = {
+	ENABLE_PUSH = false;
+}
+
 local request_methods = {
 	hsts = default_hsts_store;
 	proxies = default_proxies;
@@ -78,7 +82,7 @@ local function new_from_uri(uri_t, headers)
 			field = "authorization"
 		end
 		local userinfo = http_util.decodeURIComponent(uri_t.userinfo) -- XXX: this doesn't seem right, but it's same behaviour as curl
-		headers:append(field, "basic " .. basexx.to_base64(userinfo), true)
+		headers:upsert(field, "basic " .. basexx.to_base64(userinfo), true)
 	end
 	if not headers:has("user-agent") then
 		headers:append("user-agent", default_user_agent)
@@ -103,6 +107,7 @@ function request_methods:clone()
 	return setmetatable({
 		host = self.host;
 		port = self.port;
+		bind = self.bind;
 		tls = self.tls;
 		ctx = self.ctx;
 		sendname = self.sendname;
@@ -408,6 +413,7 @@ function request_methods:go(timeout)
 					ctx = self.ctx;
 					sendname = self.sendname ~= nil and self.sendname or host;
 					version = self.version;
+					h2_settings = default_h2_settings;
 				}, deadline and deadline-monotime())
 				if connection == nil then
 					sock:close()
@@ -446,6 +452,7 @@ function request_methods:go(timeout)
 				ctx = self.ctx;
 				sendname = self.sendname ~= nil and self.sendname or host;
 				version = self.version;
+				h2_settings = default_h2_settings;
 			}, deadline and deadline-monotime())
 			if connection == nil then
 				sock:close()
@@ -461,10 +468,12 @@ function request_methods:go(timeout)
 		connection, err, errno = client.connect({
 			host = host;
 			port = port;
+			bind = self.bind;
 			tls = tls;
 			ctx = self.ctx;
 			sendname = self.sendname;
 			version = self.version;
+			h2_settings = default_h2_settings;
 		}, deadline and deadline-monotime())
 		if connection == nil then
 			return nil, err, errno

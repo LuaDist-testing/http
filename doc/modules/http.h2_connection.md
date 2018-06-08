@@ -17,11 +17,17 @@ See [`connection.version`](#connection.version)
 
 ### `h2_connection:pollfd()` <!-- --> {#http.h2_connection:pollfd}
 
+See [`connection:pollfd()`](#connection:pollfd)
+
 
 ### `h2_connection:events()` <!-- --> {#http.h2_connection:events}
 
+See [`connection:events()`](#connection:events)
+
 
 ### `h2_connection:timeout()` <!-- --> {#http.h2_connection:timeout}
+
+See [`connection:timeout()`](#connection:timeout)
 
 
 ### `h2_connection:empty()` <!-- --> {#http.h2_connection:empty}
@@ -89,7 +95,7 @@ See [`connection:onidle(new_handler)`](#connection:onidle)
 ### `h2_connection:read_http2_frame(timeout)` <!-- --> {#http.h2_connection:read_http2_frame}
 
 
-### `h2_connection:write_http2_frame(typ, flags, streamid, payload, timeout)` <!-- --> {#http.h2_connection:write_http2_frame}
+### `h2_connection:write_http2_frame(typ, flags, streamid, payload, timeout, flush)` <!-- --> {#http.h2_connection:write_http2_frame}
 
 
 ### `h2_connection:ping(timeout)` <!-- --> {#http.h2_connection:ping}
